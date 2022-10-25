@@ -1,0 +1,11 @@
+{
+    "packages": {
+        "srcdir": "/home/username/debugfix/src",
+        "bindir": "/home/username/debugfix/bin"
+    },
+    "changelog": {
+        "suite": "stable",
+        "name": "Name Surname",
+        "email": "me@example.com"
+    }
+} 

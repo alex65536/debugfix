@@ -1,0 +1,298 @@
+import time
+import sys
+import json
+import os
+import subprocess
+import re
+import shutil
+import shlex
+import glob
+import argparse
+import traceback
+import appdirs
+
+###############################################################################
+
+T_RED = '\033[31m'
+T_GREEN = '\033[32m'
+T_YELLOW = '\033[33m'
+T_BOLD = '\033[1m'
+T_NORM = '\033[0m'
+
+
+class Task:
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        self.start_time = time.time()
+        sys.stderr.write(
+            f'{T_YELLOW}{T_BOLD}Start{T_NORM} {T_BOLD}{self.name}{T_NORM}.\n')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        elapsed = time.time() - self.start_time
+        sys.stderr.write(
+            f'{T_YELLOW}{T_BOLD}End{T_NORM} {T_BOLD}{self.name}{T_NORM} ' +
+            f'(in {elapsed:.3f}s).\n')
+
+
+def yesno(prompt):
+    while True:
+        s = input(prompt + ' [y/n]: ').strip().lower()
+        if s in ['y', 'yes']:
+            return True
+        if s in ['n', 'no']:
+            return False
+
+
+def die(msg):
+    sys.stderr.write(f'{T_BOLD}{T_RED}Fatal:{T_NORM} {msg}\n')
+    sys.exit(1)
+
+
+def spawn(args, **kwargs):
+    cmdline = ' '.join(map(shlex.quote, args))
+    print('$ ' + cmdline)
+    subprocess.run(args, **kwargs, check=True)
+
+###############################################################################
+
+
+def check_conf(config, key, ty):
+    subkey = key.split('/')
+    assert subkey
+    path = []
+    for item in subkey[:-1]:
+        path.append(item)
+        if item not in config or not isinstance(config[item], dict):
+            p = '/'.join(path)
+            die(f'\"{p}\" is not present in config or is not a dict')
+        config = config[item]
+    item = subkey[-1]
+    if item not in config or not isinstance(config[item], ty):
+        die(f'\"{p}\" is not present in config or has invalid type')
+    return config[item]
+
+
+config = json.load(
+    open(os.path.join(appdirs.user_config_dir(), 'config.json')))
+pkg_src = check_conf(config, 'packages/srcdir', str)
+pkg_bin = check_conf(config, 'packages/bindir', str)
+dch_suite = check_conf(config, 'changelog/suite', str)
+dch_name = check_conf(config, 'changelog/name', str)
+dch_email = check_conf(config, 'changelog/email', str)
+
+
+def mold_dch_entry(name, version, msg):
+    date = time.strftime('%a, %d %b %Y %H:%M:%S %z', time.localtime())
+    lines = []
+    lines.append(f'{name} ({version}) {dch_suite}; urgency=medium')
+    lines.append('')
+    lines.append(f'  * {msg}')
+    lines.append('')
+    lines.append(f' -- {dch_name} <{dch_email}>  {date}')
+    return '\n'.join(lines)
+
+###############################################################################
+
+
+def action_help(args):
+    parser.print_help()
+
+###############################################################################
+
+
+def action_build(args):
+    pkg_name = args.package
+    pkg_src_path = os.path.join(pkg_src, pkg_name)
+    pkg_bin_path = os.path.join(pkg_bin, pkg_name)
+
+    patch_name = args.patch
+    patch_msg = args.description
+    patch_text = open(patch_name, 'rb').read()
+
+    pkg_full_name = pkg_name if args.src_version is None else pkg_name + \
+        '=' + args.src_version
+
+    if os.path.exists(pkg_src_path):
+        if not yesno(f'Directory {pkg_src_path} exists, clean up?'):
+            die('Source path already exists')
+        shutil.rmtree(pkg_src_path)
+    os.makedirs(pkg_src_path)
+
+    if os.path.exists(pkg_bin_path):
+        if not yesno(f'Directory {pkg_bin_path} exists, clean up?'):
+            die('Binary path already exists')
+        shutil.rmtree(pkg_bin_path)
+    os.makedirs(pkg_bin_path)
+
+    build_deps = []
+
+    with Task('Calculating build-deps'):
+        p = subprocess.Popen(['apt', 'build-dep', '-s', pkg_full_name],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             universal_newlines=True)
+        for ln in p.stdout.readlines():
+            if ln.startswith('Inst '):
+                pkg = ln[5:].split()[0]
+                build_deps.append(pkg)
+            elif ln.startswith('Remv '):
+                pkg = ln[5:].split()[0]
+                raise Exception(
+                    f'apt build-dep wants to remove {pkg}, cannot handle')
+            elif ln.startswith('Conf '):
+                pass
+            else:
+                sys.stdout.write(ln)
+        status = p.wait()
+        if status != 0:
+            raise Exception(f'Process finished with exitcode {status}')
+
+    with Task('Installing build-deps'):
+        spawn(['sudo', 'apt', 'install', '--no-install-recommends'] +
+              build_deps)
+    try:
+        with Task('Downloading source code'):
+            spawn(['apt', 'source', pkg_full_name], cwd=pkg_src_path)
+
+        with Task('Locating source info'):
+            build_root = None
+            for path in glob.glob(pkg_name + '-*', root_dir=pkg_src_path):
+                if os.path.isdir(os.path.join(pkg_src_path, path)):
+                    build_root = os.path.join(pkg_src_path, path)
+                    sys.stderr.write(f'Source directory is {build_root}\n')
+                    break
+            if build_root is None:
+                raise Exception(f'No source directory found in {pkg_src_path}')
+
+            dch_path = os.path.join(build_root, 'debian', 'changelog')
+            pkg_version = None
+            for ln in open(dch_path).readlines():
+                ln = ln.strip()
+                if not ln:
+                    continue
+                if not ln.startswith(pkg_name):
+                    raise Exception(
+                        f'Cannot parse debian/changelog for version')
+                ln = ln.removeprefix(pkg_name).strip()
+                m = re.match('^\\(([^)]+)\\) .*; urgency=.*$', ln)
+                if not m:
+                    raise Exception(f'Bad debian/changelog header')
+                pkg_version = m[1]
+                sys.stderr.write(f'Version is {pkg_version}\n')
+                break
+            if pkg_version is None:
+                raise Exception(f'No version in debian/changelog')
+            pkg_old_version = pkg_version
+            pkg_version += '.0.1'
+
+        with Task('Patching the sources'):
+            spawn(['patch', '-p1'], input=patch_text, cwd=build_root)
+
+        with Task('Patching debian/changelog'):
+            dch = open(dch_path).read()
+            dch = mold_dch_entry(pkg_name, pkg_version,
+                                 patch_msg) + '\n\n' + dch
+            open(dch_path, 'w').write(dch)
+
+        with Task('Building the package'):
+            spawn(['dpkg-buildpackage', '-us', '-uc', '-b'], cwd=build_root)
+
+        with Task('Moving the binary packages'):
+            for path in glob.glob('*.deb', root_dir=pkg_src_path):
+                sys.stderr.write(f'Built package {path}')
+                shutil.move(os.path.join(pkg_src_path, path), pkg_bin_path)
+            open(os.path.join(pkg_bin_path, os.path.basename(
+                patch_name)), 'wb').write(patch_text)
+
+    except Exception as e:
+        sys.stderr.write(f'{T_RED}{T_BOLD}Error:{T_NORM} ' + str(e) + '\n')
+        sys.stderr.write(traceback.format_exc() + '\n')
+        raise
+    finally:
+        with Task('Removing build-deps'):
+            spawn(['sudo', 'apt', 'purge', '-y'] + build_deps)
+
+    sys.stderr.write(f'{T_GREEN}{T_BOLD}Success ;){T_NORM}\n')
+
+###############################################################################
+
+
+def action_install(args):
+    pkg_name = args.package
+    pkg_src_path = os.path.join(pkg_src, pkg_name)
+    pkg_bin_path = os.path.join(pkg_bin, pkg_name)
+
+    debs = []
+    all_pkgs = set()
+
+    with Task('Querying all the installed packages'):
+        p = subprocess.Popen(['dpkg-query', '--show'],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             universal_newlines=True)
+        for ln in p.stdout.readlines():
+            pkg, _ = ln.strip().split()
+            all_pkgs.add(pkg)
+        status = p.wait()
+        if status != 0:
+            raise Exception(f'Process finished with exitcode {status}')
+
+    with Task('Calculating the packages to install'):
+        for path in glob.glob('*.deb', root_dir=pkg_bin_path):
+            pkg, _ = path.split('_', maxsplit=1)
+            if pkg in all_pkgs:
+                sys.stderr.write(f'Will install {path}\n')
+                debs.append(os.path.join(pkg_bin_path, path))
+
+    if not debs:
+        sys.stderr.write(f'{T_YELLOW}{T_BOLD}No packages to install!{T_NORM}\n')
+        return
+
+    with Task('Installing the packages'):
+        spawn(['sudo', 'dpkg', '-i'] + debs)
+
+    sys.stderr.write(f'{T_GREEN}{T_BOLD}Success ;){T_NORM}\n')
+
+###############################################################################
+
+
+parser = argparse.ArgumentParser(
+    description='Builds a Debian package with a custom patch')
+parser.set_defaults(func='help')
+subparsers = parser.add_subparsers(
+    help='command to execute', dest='cmd')
+
+help_parser = subparsers.add_parser('help', help='show help')
+help_parser.set_defaults(func='help')
+
+build_parser = subparsers.add_parser('build', help='build package with patch')
+build_parser.set_defaults(func='build')
+build_parser.add_argument(
+    '-p', '--package', help='package name to build', action='store',
+    type=str, required=True)
+build_parser.add_argument(
+    '-P', '--patch', help='path to patch', action='store',
+    type=str, required=True)
+build_parser.add_argument(
+    '-d', '--description', help='description of the patch', action='store',
+    type=str, required=True)
+build_parser.add_argument(
+    '-V', '--src-version', help='source package version', action='store',
+    type=str, default=None)
+
+install_parser = subparsers.add_parser(
+    'install', help='install patched packages')
+install_parser.set_defaults(func='install')
+install_parser.add_argument(
+    '-p', '--package', help='package name to install', action='store',
+    type=str, required=True)
+
+args = parser.parse_args()
+actions = {
+    'help': action_help,
+    'build': action_build,
+    'install': action_install,
+}
+if args.func not in actions:
+    die(f'Unknown action {args.func}')
+actions[args.func](args)
