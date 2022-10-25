@@ -271,7 +271,8 @@ def action_install(args):
                 debs.append(os.path.join(pkg_bin_path, path))
 
     if not debs:
-        sys.stderr.write(f'{T_YELLOW}{T_BOLD}No packages to install!{T_NORM}\n')
+        sys.stderr.write(
+            f'{T_YELLOW}{T_BOLD}No packages to install!{T_NORM}\n')
         return
 
     with Task('Installing the packages'):
