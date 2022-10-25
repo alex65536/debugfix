@@ -256,6 +256,8 @@ def action_install(args):
                              universal_newlines=True)
         for ln in p.stdout.readlines():
             pkg, _ = ln.strip().split()
+            if ':' in pkg:
+                pkg, _ = pkg.split(':')
             all_pkgs.add(pkg)
         status = p.wait()
         if status != 0:
