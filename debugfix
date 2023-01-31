@@ -224,7 +224,7 @@ def action_build(args):
 
         with Task('Moving the binary packages'):
             for path in glob.glob('*.deb', root_dir=pkg_src_path):
-                sys.stderr.write(f'Built package {path}')
+                sys.stderr.write(f'Built package {path}\n')
                 shutil.move(os.path.join(pkg_src_path, path), pkg_bin_path)
             open(os.path.join(pkg_bin_path, os.path.basename(
                 patch_name)), 'wb').write(patch_text)
